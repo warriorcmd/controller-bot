@@ -2,12 +2,102 @@ import fs from "fs";
 import { phoneNumberFormatter } from "../helpers/formatter.js";
 import messageQueue from "../helpers/messageQueue.js";
 
-// Referencia al socket de Baileys (debe ser importado desde donde lo inicializas)
-let sock = null;
+// Mapa de sockets por tenant
+const socks = new Map();
 
-// Función para establecer el socket
-export const setSocket = (socket) => {
-    sock = socket;
+export const setSocket = (tenantId, socket) => {
+    if (!tenantId) tenantId = "default";
+    socks.set(tenantId, socket);
+};
+
+const getTenantIdFromReq = (req) => {
+    return req.headers?.["x-tenant-id"] || req.query?.tenantId || req.body?.tenantId || "default";
+};
+
+const getSockForTenant = (tenantId) => socks.get(tenantId) || null;
+
+export const getSocketForTenant = (tenantId) => getSockForTenant(tenantId);
+
+import { getTenantState, deleteTenantState } from "../helpers/botState.js";
+
+/**
+ * Eliminar sesión de un tenant: cerrar socket si existe, borrar carpeta de session
+ * y limpiar estado del tenant. Se puede invocar desde frontend para forzar
+ * recreación de la sesión (generar nuevo QR).
+ */
+export const deleteSession = async (req, res) => {
+    try {
+        const tenantId = getTenantIdFromReq(req);
+
+        console.log(`🗑️ Solicitud para eliminar sesión del tenant: ${tenantId}`);
+
+        // Validar tenantId simple para evitar path traversal
+        if (!/^[\w-]+$/.test(tenantId)) {
+            return res.status(400).json({ status: false, message: 'tenantId inválido' });
+        }
+
+        const sock = getSockForTenant(tenantId);
+
+        // Intentar cerrar socket de forma segura
+        if (sock) {
+            try {
+                if (typeof sock.logout === 'function') {
+                    await sock.logout();
+                } else if (typeof sock.close === 'function') {
+                    sock.close();
+                } else if (typeof sock.end === 'function') {
+                    sock.end();
+                }
+            } catch (err) {
+                console.error(`Error cerrando socket para ${tenantId}:`, err?.message || err);
+            }
+            socks.delete(tenantId);
+        }
+
+        // Borrar carpeta de session
+        const sessionPath = `./session/${tenantId}`;
+        try {
+            if (fs.existsSync(sessionPath)) {
+                fs.rmSync(sessionPath, { recursive: true, force: true });
+            }
+        } catch (err) {
+            console.error(`Error borrando carpeta de sesión ${sessionPath}:`, err?.message || err);
+            return res.status(500).json({ status: false, message: 'Error borrando archivos de sesión', error: err?.message || err });
+        }
+
+        // Limpiar estado en memoria
+        try {
+            deleteTenantState(tenantId);
+        } catch (err) {
+            console.error(`Error limpiando estado de tenant ${tenantId}:`, err?.message || err);
+        }
+
+        console.log(`🗑️ Sesión ${tenantId} eliminada correctamente`);
+        return res.status(200).json({ status: true, message: `Sesión ${tenantId} eliminada` });
+
+    } catch (error) {
+        console.error('Error en deleteSession:', error);
+        return res.status(500).json({ status: false, message: error?.message || error });
+    }
+};
+
+export const attachDashboardToTenant = (tenantId, dashboardSocket) => {
+    if (!tenantId) tenantId = 'default';
+    const sock = getSockForTenant(tenantId);
+    // Emitir estado y QR si tenemos información en el estado del tenant
+    try {
+        const tenantState = getTenantState(tenantId);
+        if (tenantState?.qrCode) {
+            dashboardSocket.emit('qr', { tenantId, qr: tenantState.qrCode });
+        }
+        dashboardSocket.emit('status', { tenantId, status: tenantState?.connectionStatus || 'unknown' });
+        if (tenantState?.isAuthenticated) {
+            dashboardSocket.emit('connected', { tenantId, phoneNumber: tenantState?.botInfo?.phoneNumber || null });
+        }
+    } catch (err) {
+        console.error('Error emitting attachDashboard events:', err);
+    }
+    return sock || null;
 };
 
 // ============================================================
@@ -15,6 +105,8 @@ export const setSocket = (socket) => {
 // ============================================================
 export const getChats = async (req, res) => {
     try {
+        const tenantId = getTenantIdFromReq(req);
+        const sock = getSockForTenant(tenantId);
         if (!sock) {
             return res.status(422).json({
                 status: false,
@@ -44,13 +136,13 @@ export const getChats = async (req, res) => {
 // ============================================================
 export const sendNormalMessage = async (req, res) => {
     try {
-        const { number, message } = req.body;
+        const { number, message, tenantId: ten } = req.body;
+
+        const tenantId = getTenantIdFromReq(req);
+        const sock = getSockForTenant(tenantId);
 
         if (!sock) {
-            return res.status(422).json({
-                status: false,
-                message: "Bot no está conectado"
-            });
+            return res.status(422).json({ status: false, message: "Bot no está conectado" });
         }
 
         if (!number || !message) {
@@ -61,19 +153,21 @@ export const sendNormalMessage = async (req, res) => {
         }
 
         // Agregar mensaje a la cola en lugar de enviar directamente
-        const result = await messageQueue.addToQueue({
-            type: 'text',
-            sock: sock,
-            number: number,
-            message: message
-        });
+        const promise = messageQueue.addToQueue({ type: 'text', sock: sock, tenantId, number: number, message: message });
 
-        console.log(`✅ Mensaje agregado a la cola para ${number}`);
+    console.log(`✅ Mensaje agregado a la cola para ${number} (tenant: ${tenantId})`);
+
+        // No esperes el resultado: responder inmediatamente al cliente.
+        // Manejar el resultado en background para logging/errores.
+        promise.then(result => {
+            console.log(`🔔 Mensaje procesado (background):`, result?.data || result);
+        }).catch(err => {
+            console.error(`❌ Error procesando mensaje en la cola (background):`, err?.message || err);
+        });
 
         return res.status(200).json({
             status: true,
             message: "Mensaje agregado a la cola de envío",
-            response: result,
             queueInfo: messageQueue.getQueueInfo()
         });
 
@@ -94,13 +188,10 @@ export const sendMedia = async (req, res) => {
     try {
         const { number, caption } = req.body;
         const file = req.files?.file;
+        const tenantId = getTenantIdFromReq(req);
+        const sock = getSockForTenant(tenantId);
 
-        if (!sock) {
-            return res.status(422).json({
-                status: false,
-                message: "Bot no está conectado"
-            });
-        }
+        if (!sock) return res.status(422).json({ status: false, message: "Bot no está conectado" });
 
         if (!number || !file) {
             return res.status(400).json({
@@ -110,20 +201,19 @@ export const sendMedia = async (req, res) => {
         }
 
         // Agregar mensaje con archivo a la cola
-        const result = await messageQueue.addToQueue({
-            type: 'media',
-            sock: sock,
-            number: number,
-            file: file,
-            caption: caption || ""
-        });
+        const promise = messageQueue.addToQueue({ type: 'media', sock: sock, tenantId, number: number, file: file, caption: caption || "" });
 
-        console.log(`✅ Archivo agregado a la cola para ${number}: ${file.name}`);
+    console.log(`✅ Archivo agregado a la cola para ${number} (tenant: ${tenantId}): ${file.name}`);
+
+        promise.then(result => {
+            console.log(`🔔 Archivo procesado (background):`, result?.data || result);
+        }).catch(err => {
+            console.error(`❌ Error procesando archivo en la cola (background):`, err?.message || err);
+        });
 
         return res.status(200).json({
             status: true,
             message: "Archivo agregado a la cola de envío",
-            response: result,
             queueInfo: messageQueue.getQueueInfo()
         });
 
@@ -142,12 +232,9 @@ export const sendMedia = async (req, res) => {
 // ============================================================
 export const showChats = async (req, res) => {
     try {
-        if (!sock) {
-            return res.status(422).json({
-                status: false,
-                message: "Bot no está conectado"
-            });
-        }
+        const tenantId = getTenantIdFromReq(req);
+        const sock = getSockForTenant(tenantId);
+        if (!sock) return res.status(422).json({ status: false, message: "Bot no está conectado" });
 
         // Para obtener chats en Baileys necesitas implementar un store
         // Aquí te muestro cómo hacerlo cuando implementes el store
@@ -173,13 +260,9 @@ export const sendFileToChat = async (req, res) => {
     try {
         const { chatName, caption } = req.body;
         const file = req.files?.file;
-
-        if (!sock) {
-            return res.status(422).json({
-                status: false,
-                message: "Bot no está conectado"
-            });
-        }
+        const tenantId = getTenantIdFromReq(req);
+        const sock = getSockForTenant(tenantId);
+        if (!sock) return res.status(422).json({ status: false, message: "Bot no está conectado" });
 
         if (!chatName || !file) {
             return res.status(400).json({
@@ -211,13 +294,9 @@ export const sendFileToChat = async (req, res) => {
 export const sendToChat = async (req, res) => {
     try {
         const { chatName, message } = req.body;
-
-        if (!sock) {
-            return res.status(422).json({
-                status: false,
-                message: "Bot no está conectado"
-            });
-        }
+        const tenantId = getTenantIdFromReq(req);
+        const sock = getSockForTenant(tenantId);
+        if (!sock) return res.status(422).json({ status: false, message: "Bot no está conectado" });
 
         if (!chatName || !message) {
             return res.status(400).json({
@@ -248,13 +327,9 @@ export const sendToChat = async (req, res) => {
 export const sendToGroup = async (req, res) => {
     try {
         const { groupJid, message } = req.body;
-
-        if (!sock) {
-            return res.status(422).json({
-                status: false,
-                message: "Bot no está conectado"
-            });
-        }
+        const tenantId = getTenantIdFromReq(req);
+        const sock = getSockForTenant(tenantId);
+        if (!sock) return res.status(422).json({ status: false, message: "Bot no está conectado" });
 
         if (!groupJid || !message) {
             return res.status(400).json({
@@ -264,19 +339,19 @@ export const sendToGroup = async (req, res) => {
         }
 
         // Agregar mensaje de grupo a la cola
-        const result = await messageQueue.addToQueue({
-            type: 'group',
-            sock: sock,
-            groupJid: groupJid,
-            message: message
-        });
+        const promise = messageQueue.addToQueue({ type: 'group', sock: sock, tenantId, groupJid: groupJid, message: message });
 
-        console.log(`✅ Mensaje agregado a la cola para grupo ${groupJid}`);
+    console.log(`✅ Mensaje agregado a la cola para grupo ${groupJid} (tenant: ${tenantId})`);
+
+        promise.then(result => {
+            console.log(`🔔 Mensaje de grupo procesado (background):`, result?.data || result);
+        }).catch(err => {
+            console.error(`❌ Error procesando mensaje de grupo en la cola (background):`, err?.message || err);
+        });
 
         return res.status(200).json({
             status: true,
             message: "Mensaje agregado a la cola de envío",
-            response: result,
             queueInfo: messageQueue.getQueueInfo()
         });
 

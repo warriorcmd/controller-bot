@@ -3,6 +3,8 @@
  * Implementa un queue que envía mensajes de forma secuencial con delay
  */
 
+import { getTenantState } from "./botState.js";
+
 class MessageQueue {
     constructor() {
         this.queue = [];
@@ -89,6 +91,9 @@ class MessageQueue {
      */
     async addToQueue(messageData) {
         return new Promise((resolve, reject) => {
+            // Asegurar que siempre haya tenantId en el data del item
+            if (!messageData.tenantId) messageData.tenantId = messageData?.tenantId || 'default';
+
             const queueItem = {
                 id: Date.now() + Math.random(),
                 data: messageData,
@@ -102,7 +107,7 @@ class MessageQueue {
             this.stats.totalQueued++;
             this.stats.currentQueueSize = this.queue.length;
 
-            console.log(`📥 Mensaje agregado a la cola (Posición: ${this.queue.length})`);
+            console.log(`📥 Mensaje agregado a la cola (tenant: ${messageData.tenantId}, posición: ${this.queue.length})`);
 
             // Si no se está procesando, iniciar procesamiento
             if (!this.isProcessing) {
@@ -124,15 +129,74 @@ class MessageQueue {
 
         while (this.queue.length > 0) {
             const item = this.queue[0]; // Obtener el primero sin quitarlo aún
-            
+            // Si el item está marcado como en espera (waiting) lo saltamos en esta pasada
+            // (se utiliza cuando el tenant está desconectado para no consumir retries)
+            if (item.waiting) {
+                // Si todos los items están en espera, esperamos un poco antes de reintentar
+                const allWaiting = this.queue.every(q => q.waiting);
+                if (allWaiting) {
+                    console.log('⏳ Todos los mensajes están esperando reconexión. Esperando 5s antes de reintentar...');
+                    await this.sleep(5000);
+
+                    // Después de esperar, re-evaluar los items en espera: si el tenant se reconectó,
+                    // actualizar la referencia del socket y limpiar la marca 'waiting' para que
+                    // sean procesados en la siguiente iteración.
+                    for (const qItem of this.queue) {
+                        if (!qItem.waiting) continue;
+                        try {
+                            const tId = qItem.data?.tenantId || 'default';
+                            const tstate = getTenantState(tId);
+                            if (tstate && tstate.connectionStatus === 'connected') {
+                                if (tstate.sock && tstate.sock !== qItem.data.sock) {
+                                    console.log(`ℹ️ Socket para ${tId} cambió — actualizando referencia para mensaje ${qItem.id} y limpiando espera`);
+                                    qItem.data.sock = tstate.sock;
+                                }
+                                qItem.waiting = false;
+                            }
+                        } catch (err) {
+                            // No bloquear el loop por errores al re-evaluar
+                            console.error('Error re-evaluando item en espera:', err?.message || err);
+                        }
+                    }
+                } else {
+                    // Mover este item al final para procesar otros
+                    this.queue.shift();
+                    this.queue.push(item);
+                }
+                continue;
+            }
+
             try {
                 console.log(`⏳ Procesando mensaje ${item.id} (${item.data.type}) a ${item.data.number || item.data.groupJid}`);
                 
+                // Antes de enviar, comprobar si el tenant/socket está conectado. Si no, marcar en espera
+                const tenantIdFromData = item.data?.tenantId || 'default';
+                const tenantState = getTenantState(tenantIdFromData);
+                // Si no hay estado o no está conectado, marcar en espera
+                if (!tenantState || tenantState.connectionStatus !== 'connected') {
+                    console.log(`⚠️ Tenant ${tenantIdFromData} desconectado — marcando mensaje ${item.id} en espera`);
+                    item.waiting = true;
+                    // Mover al final de la cola para intentar otros mensajes
+                    this.queue.shift();
+                    this.queue.push(item);
+                    // No consumir retry en este caso. Continuar con siguiente mensaje.
+                    continue;
+                }
+
+                // Si el tenant está conectado pero la referencia del socket cambió,
+                // actualizar la referencia del socket en el item para poder enviar.
+                if (tenantState.sock && tenantState.sock !== item.data.sock) {
+                    console.log(`ℹ️ Socket para ${tenantIdFromData} cambió — actualizando referencia para mensaje ${item.id}`);
+                    item.data.sock = tenantState.sock;
+                }
+
                 // Ejecutar el envío del mensaje
                 const result = await this.sendMessage(item);
                 
                 // Si fue exitoso, resolver la promesa y quitar de la cola
                 item.resolve(result);
+                // Si estaba en espera, limpiar la marca
+                if (item.waiting) item.waiting = false;
                 this.queue.shift();
                 this.stats.totalSent++;
                 this.stats.currentQueueSize = this.queue.length;
@@ -202,9 +266,17 @@ class MessageQueue {
     async sendTextMessage(item) {
         const { data } = item;
         const jid = data.number.includes("@") ? data.number : `${data.number}@c.us`;
-        
+
+        // Verificar que el socket del tenant siga siendo el mismo y esté conectado
+        const tId = data?.tenantId || 'default';
+        const tstate = getTenantState(tId);
+        if (!tstate || tstate.connectionStatus !== 'connected' || tstate.sock !== data.sock) {
+            console.log(`⚠️ Socket no conectado o cambiado para tenant ${tId}, abortando envío temporalmente`);
+            throw new Error('Connection Closed');
+        }
+
         const response = await data.sock.sendMessage(jid, { text: data.message });
-        
+
         return {
             status: true,
             response: response,
@@ -253,6 +325,14 @@ class MessageQueue {
             };
         }
         
+        // Verificar socket activo antes de enviar
+        const tId = data?.tenantId || 'default';
+        const tstate = getTenantState(tId);
+        if (!tstate || tstate.connectionStatus !== 'connected' || tstate.sock !== data.sock) {
+            console.log(`⚠️ Socket no conectado o cambiado para tenant ${tId}, abortando envío de media temporalmente`);
+            throw new Error('Connection Closed');
+        }
+
         const response = await data.sock.sendMessage(jid, messageContent);
         
         return {
@@ -274,9 +354,17 @@ class MessageQueue {
     async sendGroupMessage(item) {
         const { data } = item;
         const jid = data.groupJid.includes("@") ? data.groupJid : `${data.groupJid}@g.us`;
-        
+
+        // Verificar socket activo antes de enviar a grupo
+        const tId = data?.tenantId || 'default';
+        const tstate = getTenantState(tId);
+        if (!tstate || tstate.connectionStatus !== 'connected' || tstate.sock !== data.sock) {
+            console.log(`⚠️ Socket no conectado o cambiado para tenant ${tId}, abortando envío a grupo temporalmente`);
+            throw new Error('Connection Closed');
+        }
+
         const response = await data.sock.sendMessage(jid, { text: data.message });
-        
+
         return {
             status: true,
             response: response,
@@ -380,6 +468,8 @@ class MessageQueue {
             console.log(`❌ Preset desconocido. Opciones: ${Object.keys(presets).join(', ')}`);
         }
     }
+
+    // Importar getTenantState de botState para verificar estado del tenant antes de enviar
 }
 
 // Exportar una única instancia (Singleton)
