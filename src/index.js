@@ -120,7 +120,10 @@ app.post("/api/session/delete", deleteSession);
 
 const PORT = botState.PORT;
 const server = http.createServer(app);
-const io = new IOServer(server, { cors: { origin: "*" } });
+const io = new IOServer(server, { 
+    cors: { origin: "*" },
+    transports: ["websocket", "polling"]
+});
 
 io.on("connection", (socket) => {
     console.log("🔌 Dashboard client connected", socket.id);
