@@ -11,6 +11,7 @@ services:
       - NODE_ENV=production
       - PORT=3000
       - TZ=America/Lima
+      - SDRIMSAC_BOT_URL=https://sdrimsac.xyz
     
     # Volúmenes persistentes
     volumes:

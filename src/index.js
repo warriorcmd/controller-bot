@@ -8,6 +8,7 @@ import { startBot } from "./helpers/startBot.js"
 import { botState, getTenantState } from "./helpers/botState.js";
 import http from "http";
 import { Server as IOServer } from "socket.io";
+import { initSdrimsacConnection, emitToSdrimsac, onSdrimsacEvent } from "./helpers/sdrimsacConnection.js";
 
 
 const __filename = fileURLToPath(import.meta.url);
@@ -154,5 +155,10 @@ server.listen(PORT, () => {
     console.log(`📊 Dashboard disponible`);
     console.log(`📡 API REST lista`);
     console.log("");
+    
+    // Inicializar conexión a sdrimsacbot
+    console.log("🔗 Conectando a sdrimsacbot...");
+    initSdrimsacConnection();
+    
     startBot();
 });
